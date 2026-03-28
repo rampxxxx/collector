@@ -15,7 +15,7 @@ spec:
     spec:
       project: default
       source:
-        repoURL: git@github.com:rampxxxx/collector.git # MUST BE UPDATED
+        repoURL: https://github.com/rampxxxx/collector.git # MUST BE UPDATED
         targetRevision: HEAD
         path: my-fleet-ops/charts/rust-collector
         helm:
