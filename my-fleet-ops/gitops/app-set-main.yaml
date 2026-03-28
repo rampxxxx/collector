@@ -1,0 +1,32 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: main-apps
+  namespace: argocd
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            type: main
+  template:
+    metadata:
+      name: '{{name}}-golang-api'
+    spec:
+      project: default
+      source:
+        repoURL: git@github.com:rampxxxx/collector.git # MUST BE UPDATED
+        targetRevision: HEAD
+        path: my-fleet-ops/charts/golang-api
+        helm:
+          valueFiles:
+            - ../../apps-config/main-values.yaml
+      destination:
+        server: '{{server}}'
+        namespace: default
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true

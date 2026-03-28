@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rust-collector.fullname" . }}
+  labels:
+    {{- include "rust-collector.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rust-collector.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rust-collector.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: rust-collector
+          image: hashicorp/http-echo
+          args:
+            - "-text=Hello from Rust Collector on Edge Cluster"
+          ports:
+            - name: http
+              containerPort: 5678
+              protocol: TCP
