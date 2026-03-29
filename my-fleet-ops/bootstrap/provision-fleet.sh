@@ -147,7 +147,7 @@ install_metallb() {
     local start=$3
     local end=$4
     
-    echo "📦 Installing MetalLB on $context..."
+    echo "📦 Configuring MetalLB on $context (Range: ${ip_prefix}.${start}-${ip_prefix}.${end})..."
     kubectl config use-context "$context"
     
     if ! kubectl get ns metallb-system &>/dev/null; then
@@ -155,9 +155,12 @@ install_metallb() {
         echo "⏳ Waiting for MetalLB pods to be registered..."
         sleep 10
         kubectl wait --for=condition=ready pod -l app=metallb -n metallb-system --timeout=300s
-        
-        # Configure MetalLB with a range in the libvirt network (192.168.122.x)
-        cat <<EOF | kubectl apply -f -
+    else
+        echo "✅ MetalLB already installed on $context. Ensuring config is up to date..."
+    fi
+    
+    # ALWAYS configure/update MetalLB with a range in the libvirt network (192.168.122.x)
+    cat <<EOF | kubectl apply -f -
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
@@ -173,9 +176,6 @@ metadata:
   name: l2-advert
   namespace: metallb-system
 EOF
-    else
-        echo "✅ MetalLB already installed on $context."
-    fi
 }
 
 # Install MetalLB on Main (Range .200-.210)
