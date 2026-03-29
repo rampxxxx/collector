@@ -1,0 +1,29 @@
+replicaCount: 1
+service:
+  type: LoadBalancer
+  port: 1883
+persistence:
+  enabled: false
+role: central # Options: central, edge
+
+# Central Broker Address (needed if role is 'edge')
+central_broker:
+  host: "192.168.122.200" # Placeholder, will be updated with actual MetalLB IP
+  port: 1883
+
+config: |
+  persistence true
+  persistence_location /mosquitto/data/
+  log_dest stdout
+  listener 1883
+  allow_anonymous true
+
+# Bridge configuration for 'edge' role
+bridge_config: |
+  connection to-central
+  address {{ .Values.central_broker.host }}:{{ .Values.central_broker.port }}
+  topic sensors/# out 1
+  topic commands/# in 1
+  remote_clientid edge-node-01
+  start_type automatic
+  notifications true

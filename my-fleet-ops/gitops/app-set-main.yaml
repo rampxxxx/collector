@@ -5,19 +5,29 @@ metadata:
   namespace: argocd
 spec:
   generators:
-    - clusters:
-        selector:
-          matchLabels:
-            type: main
+    - matrix:
+        generators:
+          - clusters:
+              selector:
+                matchLabels:
+                  type: main
+              values:
+                clusterName: '{{name}}'
+          - list:
+              elements:
+                - appPath: my-fleet-ops/charts/golang-api
+                  appName: golang-api
+                - appPath: my-fleet-ops/charts/mqtt-broker
+                  appName: mqtt-broker
   template:
     metadata:
-      name: '{{name}}-golang-api'
+      name: '{{values.clusterName}}-{{appName}}'
     spec:
       project: default
       source:
-        repoURL: https://github.com/rampxxxx/collector.git # MUST BE UPDATED
+        repoURL: https://github.com/rampxxxx/collector.git
         targetRevision: HEAD
-        path: my-fleet-ops/charts/golang-api
+        path: '{{appPath}}'
         helm:
           valueFiles:
             - ../../apps-config/main-values.yaml
