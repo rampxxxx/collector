@@ -10,8 +10,8 @@ TEMPLATE_FILE="./opensuse-tumbleweed-cloud-template.qcow2"
 # Configuration variables
 SSH_KEY_NAME="collector"
 SSH_KEY_PATH="$HOME/.ssh"
-VM_RAM="2048"
-VM_VCPUS="2"
+VM_RAM="${VM_RAM:-2048}"
+VM_VCPUS="${VM_VCPUS:-2}"
 VM_DISK_SIZE="20G"
 
 usage() {
