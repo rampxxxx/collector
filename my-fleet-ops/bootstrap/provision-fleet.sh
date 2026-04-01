@@ -11,8 +11,8 @@ RANCHER_ADMIN_USER="admin"
 
 # --- VM Creation ---
 echo "🖥️ Creating Virtual Machines..."
-# Main cluster needs more resources for Rancher
-VM_RAM=4000 VM_VCPUS=4 sudo -E "$VM_MANAGER" create "$MAIN_VM_NAME" "$HOME/.ssh"
+# Main cluster needs more resources for Rancher (6GB RAM)
+VM_RAM=6144 VM_VCPUS=4 sudo -E "$VM_MANAGER" create "$MAIN_VM_NAME" "$HOME/.ssh"
 # Edge cluster can stay minimal
 sudo "$VM_MANAGER" create "$EDGE_VM_NAME" "$HOME/.ssh"
 
@@ -22,6 +22,7 @@ get_vm_ip() {
 	echo "⏳ Waiting for IP for $name..." >&2
 	while [ -z "$ip" ]; do
 		# We use sudo virsh as it requires privileges
+		# virsh domifaddr output is a table, we extract the IPv4 address
 		ip=$(sudo virsh domifaddr "$name" 2>/dev/null | grep ipv4 | awk '{print $4}' | cut -d/ -f1)
 		[ -z "$ip" ] && sleep 2
 	done
@@ -67,20 +68,21 @@ echo "Configured: $CLUSTER_MAIN_NAME ($MAIN_TYPE) and $CLUSTER_EDGE_NAME ($EDGE_
 # 1. Provision Clusters via k3sup
 echo "📦 Installing K3s on $CLUSTER_MAIN_NAME..."
 k3sup install \
-	--ip $MAIN_IP \
-	--user $SSH_USER \
-	--ssh-key $SSH_KEY \
+	--ip "$MAIN_IP" \
+	--user "$SSH_USER" \
+	--ssh-key "$SSH_KEY" \
 	--context $CLUSTER_MAIN_NAME \
-	--local-path $HOME/.kube/config \
-	--merge
+	--local-path "$HOME/.kube/config" \
+	--merge \
+	--k3s-extra-args "--disable servicelb"
 
 echo "📦 Installing K3s on $CLUSTER_EDGE_NAME..."
 k3sup install \
-	--ip $EDGE_IP \
-	--user $SSH_USER \
-	--ssh-key $SSH_KEY \
+	--ip "$EDGE_IP" \
+	--user "$SSH_USER" \
+	--ssh-key "$SSH_KEY" \
 	--context $CLUSTER_EDGE_NAME \
-	--local-path $HOME/.kube/config \
+	--local-path "$HOME/.kube/config" \
 	--merge \
 	--k3s-extra-args "--disable traefik --disable servicelb"
 
@@ -94,7 +96,7 @@ fi
 
 # 1.5 Verify API Reachability
 echo "🔍 Checking API reachability for $CLUSTER_MAIN_NAME..."
-until curl -sk https://$MAIN_IP:6443/livez >/dev/null; do
+until curl -sk "https://$MAIN_IP:6443/livez" >/dev/null; do
 	echo "⏳ Waiting for API server at $MAIN_IP:6443..."
 	echo "🔍 Checking K3s status on VM..."
 	ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$MAIN_IP" "systemctl is-active k3s" || echo "⚠️ K3s service is NOT active yet."
@@ -106,6 +108,22 @@ echo "✅ API server is reachable."
 # 2. INSTALL ARGOCD
 export KUBECONFIG=$HOME/.kube/config
 kubectl config use-context $CLUSTER_MAIN_NAME
+
+argocd_login_with_retries() {
+	local ip=$1
+	local port=$2
+	local password=$3
+	echo "🔐 Logging into ArgoCD CLI ($ip:$port)..."
+	for i in {1..10}; do
+		if argocd login "$ip:$port" --username admin --password "$password" --insecure --grpc-web; then
+			echo "✅ Successfully logged into ArgoCD"
+			return 0
+		fi
+		echo "⏳ ArgoCD login failed, retrying in 15s ($i/10)..."
+		sleep 15
+	done
+	return 1
+}
 
 if ! kubectl get ns argocd &>/dev/null; then
 	echo "📦 ArgoCD not found. Installing via Helm..."
@@ -131,14 +149,13 @@ if ! kubectl get ns argocd &>/dev/null; then
 
 	# Get NodePort for login
 	ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
-	echo "🔐 Logging into ArgoCD CLI..."
-	argocd login "$MAIN_IP:$ARGOCD_PORT" --username admin --password "$PASS" --insecure --grpc-web
+	argocd_login_with_retries "$MAIN_IP" "$ARGOCD_PORT" "$PASS"
 else
 	echo "✅ ArgoCD already installed. Re-logging..."
 	PASS=$(cat argocd_initial_password.txt 2>/dev/null || echo "")
 	if [ ! -z "$PASS" ]; then
 		ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
-		argocd login "$MAIN_IP:$ARGOCD_PORT" --username admin --password "$PASS" --insecure --grpc-web
+		argocd_login_with_retries "$MAIN_IP" "$ARGOCD_PORT" "$PASS"
 	else
 		echo "⚠️ No password file found, assuming already logged in or using --core"
 		argocd login --core
@@ -192,8 +209,24 @@ install_metallb "$CLUSTER_EDGE_NAME" "192.168.122" 211 220
 echo "🔗 Registering clusters with ArgoCD..."
 kubectl config use-context "$CLUSTER_MAIN_NAME"
 
-argocd cluster add $CLUSTER_MAIN_NAME --name $CLUSTER_MAIN_NAME --label type=$MAIN_TYPE --upsert -y --grpc-web --insecure
-argocd cluster add $CLUSTER_EDGE_NAME --name $CLUSTER_EDGE_NAME --label type=$EDGE_TYPE --upsert -y --grpc-web --insecure
+register_cluster_with_retries() {
+	local name=$1
+	local type=$2
+	echo "🔗 Registering $name ($type) with retries..."
+	for i in {1..10}; do
+		if argocd cluster add "$name" --name "$name" --label "type=$type" --upsert -y --grpc-web --insecure; then
+			echo "✅ Successfully registered $name"
+			return 0
+		fi
+		echo "⏳ Registration failed, retrying in 10s ($i/10)..."
+		sleep 10
+	done
+	echo "❌ Failed to register $name after 10 attempts."
+	return 1
+}
+
+register_cluster_with_retries "$CLUSTER_MAIN_NAME" "$MAIN_TYPE"
+register_cluster_with_retries "$CLUSTER_EDGE_NAME" "$EDGE_TYPE"
 
 ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
 
@@ -229,103 +262,202 @@ install_rancher() {
 		helm install rancher rancher-stable/rancher \
 			--namespace cattle-system \
 			--create-namespace \
-			--set hostname=rancher.$MAIN_IP.sslip.io \
+			--set hostname=rancher."$MAIN_IP".sslip.io \
 			--set bootstrapPassword=$RANCHER_ADMIN_USER \
 			--set replicas=1 \
 			--set service.type=LoadBalancer
 
-		echo "⏳ Waiting for Rancher pods..."
-		kubectl wait --for=condition=available deployment/rancher -n cattle-system --timeout=300s
+		echo "⏳ Waiting for Rancher deployment rollout..."
+		until kubectl rollout status deployment/rancher -n cattle-system --timeout=300s | grep -i "successfully"; do
+			echo "⏳ Waiting for successful rollout message..."
+			sleep 10
+		done
+		echo "✅ Rancher rollout complete."
+
+		echo "⏳ Final wait for all pods in cattle-system to be ready..."
+		kubectl wait --for=condition=ready pod --all -n cattle-system --timeout=300s
 	else
-		echo "✅ Rancher already installed on $context."
+		echo "✅ Rancher already installed on $context. Ensuring components are ready..."
+		kubectl wait --for=condition=ready pod --all -n cattle-system --timeout=120s
 	fi
 }
 
 import_to_rancher() {
 	local edge_context=$1
-	local rancher_host="rancher.$MAIN_IP.sslip.io"
 	local EMPTY_TOKEN="EMPTY"
 
 	echo "🔗 Automatically importing $edge_context into Rancher..."
 
-	# 1. Login to get a token
-	echo "🔑 Logging into Rancher API..."
-	LOGIN_RESPONSE=$(curl -sk "https://$rancher_host/v3-public/localProviders/local?action=login" \
-		-H 'Content-Type: application/json' \
-		-d "{\"username\":\"$RANCHER_ADMIN_USER\",\"password\":\"$RANCHER_ADMIN_USER\"}" || echo "Error login into Rancher" && return 0)
+	# Get the actual LoadBalancer IP for Rancher
+	echo "🔍 Finding Rancher LoadBalancer IP..."
+	local rancher_ip=""
+	for i in {1..20}; do
+		rancher_ip=$(kubectl -n cattle-system get svc rancher -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+		[ ! -z "$rancher_ip" ] && [ "$rancher_ip" != "null" ] && break
+		echo "⏳ Waiting for Rancher LoadBalancer IP ($i/20)..."
+		sleep 10
+	done
 
-	TOKEN=$(echo "$LOGIN_RESPONSE" | grep -oP '"token":"\K[^"]+' || echo "$EMPTY_TOKEN")
-
-	if [ -z "$TOKEN" ] || [ "$TOKEN" == "$EMPTY_TOKEN" ]; then
-		echo "❌ Failed to get Rancher token. Skipping automated import."
+	if [ -z "$rancher_ip" ]; then
+		echo "❌ Failed to find Rancher LoadBalancer IP. Skipping import."
 		return
 	fi
 
+	local rancher_host="rancher.$rancher_ip.sslip.io"
+	echo "📍 Rancher Host: $rancher_host"
+
+	# 1. Login to get a token
+	echo "🔑 Logging into Rancher API..."
+	LOGIN_RESPONSE=""
+	for i in {1..12}; do
+		LOGIN_RESPONSE=$(curl -sk "https://$rancher_host/v3-public/localProviders/local?action=login" \
+			-H 'Content-Type: application/json' \
+			-d "{\"username\":\"$RANCHER_ADMIN_USER\",\"password\":\"$RANCHER_ADMIN_USER\"}" || echo '{"type":"error","message":"curl_failed"}')
+
+		if echo "$LOGIN_RESPONSE" | jq -e '.token' >/dev/null 2>&1; then
+			break
+		fi
+		echo "⏳ Waiting for Rancher API to be ready ($i/12)..."
+		sleep 15
+	done
+
+	if echo "$LOGIN_RESPONSE" | jq -e '.type == "error"' >/dev/null 2>&1; then
+		echo "❌ Rancher login failed: $(echo "$LOGIN_RESPONSE" | jq -r .message)"
+		return
+	fi
+
+	TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r .token)
+	echo "✅ Obtained API Token: ${TOKEN:0:10}..."
+
+	# 1.5 CONFIGURE RANCHER SETTINGS (CRITICAL for self-signed lab)
+	echo "⚙️ Setting Rancher server-url to https://$rancher_host..."
+	curl -sk "https://$rancher_host/v3/settings/server-url" \
+		-H "Authorization: Bearer $TOKEN" \
+		-H 'Content-Type: application/json' \
+		-X PUT \
+		-d "{\"value\":\"https://$rancher_host\"}" > /dev/null
+
+	echo "⚙️ Clearing Rancher cacerts (allowing self-signed)..."
+	curl -sk "https://$rancher_host/v3/settings/cacerts" \
+		-H "Authorization: Bearer $TOKEN" \
+		-H 'Content-Type: application/json' \
+		-X PUT \
+		-d "{\"value\":\"\"}" > /dev/null
+
 	# 2. Check/Create Cluster Resource
 	echo "🏗️ Checking cluster resource in Rancher..."
-	CLUSTER_ID=$(curl -sk "https://$rancher_host/v3/clusters?name=$edge_context" \
-		-H "Authorization: Bearer $TOKEN" | grep -oP '"id":"\K[^"]+' | head -1)
+	CLUSTER_ID=""
+	for i in {1..5}; do
+		CLUSTER_ID=$(curl -sk "https://$rancher_host/v3/clusters?name=$edge_context" \
+			-H "Authorization: Bearer $TOKEN" | jq -r '.data[0].id // ""')
+		[ ! -z "$CLUSTER_ID" ] && [ "$CLUSTER_ID" != "null" ] && break
+		sleep 5
+	done
 
-	if [ -z "$CLUSTER_ID" ]; then
+	if [ -z "$CLUSTER_ID" ] || [ "$CLUSTER_ID" == "null" ]; then
 		echo "🏗️ Creating cluster resource in Rancher..."
 		CLUSTER_ID=$(curl -sk "https://$rancher_host/v3/clusters" \
 			-H "Authorization: Bearer $TOKEN" \
 			-H 'Content-Type: application/json' \
-			-d "{\"type\":\"cluster\",\"name\":\"$edge_context\"}" | grep -oP '"id":"\K[^"]+')
+			-d "{\"type\":\"cluster\",\"name\":\"$edge_context\"}" | jq -r .id)
+		echo "⏳ Giving Rancher 30s to initialize the new cluster object..."
+		sleep 30
 	fi
+	echo "🆔 Cluster ID: $CLUSTER_ID"
 
 	# 3. Retrieve Registration Command
 	echo "📋 Retrieving registration command..."
 	TOKEN_ID=""
 	for i in {1..15}; do
 		TOKEN_ID=$(curl -sk "https://$rancher_host/v3/clusterregistrationtokens?clusterId=$CLUSTER_ID" \
-			-H "Authorization: Bearer $TOKEN" | grep -oP '"data":\[.*?"id":"\K[^"]+' | head -1)
-		[ ! -z "$TOKEN_ID" ] && break
-		sleep 5
+			-H "Authorization: Bearer $TOKEN" | jq -r '.data[0].id // ""')
+		[ ! -z "$TOKEN_ID" ] && [ "$TOKEN_ID" != "null" ] && break
+		echo "⏳ No token found, explicitly requesting Rancher to generate one ($i/15)..."
+		curl -sk "https://$rancher_host/v3/clusterregistrationtokens" \
+			-H "Authorization: Bearer $TOKEN" \
+			-H 'Content-Type: application/json' \
+			-d "{\"type\":\"clusterRegistrationToken\",\"clusterId\":\"$CLUSTER_ID\"}" >/dev/null
+		sleep 10
 	done
+	echo "🆔 Token ID: $TOKEN_ID"
 
 	REG_VALUE=""
+	MANIFEST_URL=""
+	CLUSTER_TOKEN=""
 	for i in {1..20}; do
 		REG_DATA=$(curl -sk "https://$rancher_host/v3/clusterregistrationtokens/$TOKEN_ID" \
 			-H "Authorization: Bearer $TOKEN")
-		REG_VALUE=$(echo "$REG_DATA" | grep -oP '"insecureCommand":"\K[^"]+')
-		[ ! -z "$REG_VALUE" ] && break
-		sleep 5
+
+		REG_VALUE=$(echo "$REG_DATA" | jq -r '.insecureCommand // ""')
+		MANIFEST_URL=$(echo "$REG_DATA" | jq -r '.manifestUrl // ""')
+		CLUSTER_TOKEN=$(echo "$REG_DATA" | jq -r '.token // ""')
+
+		if ([ ! -z "$REG_VALUE" ] && [ "$REG_VALUE" != "null" ]) || \
+		   ([ ! -z "$MANIFEST_URL" ] && [ "$MANIFEST_URL" != "null" ]) || \
+		   ([ ! -z "$CLUSTER_TOKEN" ] && [ "$CLUSTER_TOKEN" != "null" ]); then
+			break
+		fi
+		echo "⏳ Waiting for Rancher to populate registration data ($i/20)..."
+		sleep 15
 	done
+	echo "🔑 Cluster Token: ${CLUSTER_TOKEN:0:10}..."
+
 	# 4. Apply to Edge Cluster
 	echo "🚀 Applying registration to $edge_context..."
 	kubectl config use-context "$edge_context"
-	if [ ! -z "$REG_VALUE" ]; then
-		CLEAN_VAL=$(echo "$REG_VALUE" | sed 's/\\//g')
 
-		# Extract the URL from the curl command if it's already a full command
-		if [[ "$CLEAN_VAL" == *"http"* ]]; then
-			# Regex to find the URL inside the string
-			MANIFEST_URL=$(echo "$CLEAN_VAL" | grep -oP 'https?://[^ ]+')
-			echo "📥 Downloading registration manifest from: $MANIFEST_URL"
-			curl -skL -H "Authorization: Bearer $TOKEN" "$MANIFEST_URL" >registration.yaml
-
-			if [ -s registration.yaml ]; then
-				echo "📄 Manifest downloaded successfully. Applying..."
-				kubectl apply -f registration.yaml
-				rm registration.yaml
-			else
-				echo "❌ Downloaded manifest is empty. Skipping apply."
-			fi
+	APPLIED=false
+	if [ ! -z "$REG_VALUE" ] && [ "$REG_VALUE" != "null" ]; then
+		echo "Executing registration command..."
+		eval "$REG_VALUE" && APPLIED=true || echo "⚠️ Warning: Command execution failed."
+	elif ([ ! -z "$MANIFEST_URL" ] && [ "$MANIFEST_URL" != "null" ]) || ([ ! -z "$CLUSTER_TOKEN" ] && [ "$CLUSTER_TOKEN" != "null" ]); then
+		if [ ! -z "$MANIFEST_URL" ] && [ "$MANIFEST_URL" != "null" ]; then
+			CLEAN_URL="$MANIFEST_URL"
 		else
-			echo "❌ Unrecognized registration command format: $CLEAN_VAL"
+			CLEAN_URL="https://$rancher_host/v3/import/${CLUSTER_TOKEN}.yaml"
+			echo "🌐 Using cluster token fallback URL..."
 		fi
-	else
-		echo "❌ Could not find registration command."
+
+		echo "📥 Downloading manifest from: $CLEAN_URL"
+		curl -skL "$CLEAN_URL" >registration.yaml
+
+		if grep -q "apiVersion" registration.yaml; then
+			echo "📄 Valid manifest found. Applying..."
+			kubectl apply -f registration.yaml && APPLIED=true
+			rm registration.yaml
+		else
+			echo "❌ Downloaded manifest is invalid."
+			rm registration.yaml
+		fi
 	fi
+
+	if [ "$APPLIED" = true ]; then
+		# Patch for self-signed certificates
+		echo "🛡️ Waiting for cattle-cluster-agent deployment to appear..."
+		for i in {1..20}; do
+			if kubectl -n cattle-system get deployment cattle-cluster-agent &>/dev/null; then
+				echo "✅ Agent deployment found. Patching for insecure connection..."
+				# We set CATTLE_INSECURE=true, CATTLE_INSECURE_SKIP_VERIFY=true AND clear CATTLE_CA_CHECKSUM to bypass all TLS checks
+				kubectl -n cattle-system patch deployment cattle-cluster-agent --type=json \
+					-p '[{"op":"add", "path":"/spec/template/spec/containers/0/env/-", "value":{"name":"CATTLE_INSECURE", "value":"true"}}, {"op":"add", "path":"/spec/template/spec/containers/0/env/-", "value":{"name":"CATTLE_INSECURE_SKIP_VERIFY", "value":"true"}}, {"op":"add", "path":"/spec/template/spec/containers/0/env/-", "value":{"name":"CATTLE_CA_CHECKSUM", "value":""}}]'
+				break
+			fi
+			sleep 10
+		done
+	else
+		echo "❌ Could not find or construct registration command."
+	fi
+
 	kubectl config use-context "$CLUSTER_MAIN_NAME"
 }
 
 # Run Rancher steps, but don't fail the whole script if they hit a snag
-install_rancher "$CLUSTER_MAIN_NAME" || echo "⚠️ Warning: Rancher installation encountered an issue."
-import_to_rancher "$CLUSTER_EDGE_NAME" || echo "⚠️ Warning: Automated edge import encountered an issue."
+install_rancher "$CLUSTER_MAIN_NAME" || echo "⚠️ Rancher install issue."
+import_to_rancher "$CLUSTER_EDGE_NAME" || echo "⚠️ Edge import issue."
 
-RANCHER_URL="https://rancher.$MAIN_IP.sslip.io"
+# Get the final Rancher URL (using LoadBalancer IP)
+FINAL_RANCHER_IP=$(kubectl -n cattle-system get svc rancher -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "$MAIN_IP")
+RANCHER_URL="https://rancher.$FINAL_RANCHER_IP.sslip.io"
 
 echo "-------------------------------------------------------"
 echo "✅ Infrastructure is Ready!"
