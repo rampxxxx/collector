@@ -337,13 +337,6 @@ import_to_rancher() {
 		-X PUT \
 		-d "{\"value\":\"https://$rancher_host\"}" > /dev/null
 
-	echo "⚙️ Clearing Rancher cacerts (allowing self-signed)..."
-	curl -sk "https://$rancher_host/v3/settings/cacerts" \
-		-H "Authorization: Bearer $TOKEN" \
-		-H 'Content-Type: application/json' \
-		-X PUT \
-		-d "{\"value\":\"\"}" > /dev/null
-
 	# 2. Check/Create Cluster Resource
 	echo "🏗️ Checking cluster resource in Rancher..."
 	CLUSTER_ID=""
@@ -402,50 +395,18 @@ import_to_rancher() {
 	done
 	echo "🔑 Cluster Token: ${CLUSTER_TOKEN:0:10}..."
 
-	# 4. Apply to Edge Cluster
+	# 4. Apply to Edge Cluster (Insecure Import)
 	echo "🚀 Applying registration to $edge_context..."
 	kubectl config use-context "$edge_context"
-
-	APPLIED=false
-	if [ ! -z "$REG_VALUE" ] && [ "$REG_VALUE" != "null" ]; then
-		echo "Executing registration command..."
-		eval "$REG_VALUE" && APPLIED=true || echo "⚠️ Warning: Command execution failed."
-	elif ([ ! -z "$MANIFEST_URL" ] && [ "$MANIFEST_URL" != "null" ]) || ([ ! -z "$CLUSTER_TOKEN" ] && [ "$CLUSTER_TOKEN" != "null" ]); then
-		if [ ! -z "$MANIFEST_URL" ] && [ "$MANIFEST_URL" != "null" ]; then
-			CLEAN_URL="$MANIFEST_URL"
-		else
-			CLEAN_URL="https://$rancher_host/v3/import/${CLUSTER_TOKEN}.yaml"
-			echo "🌐 Using cluster token fallback URL..."
-		fi
-
-		echo "📥 Downloading manifest from: $CLEAN_URL"
-		curl -skL "$CLEAN_URL" >registration.yaml
-
-		if grep -q "apiVersion" registration.yaml; then
-			echo "📄 Valid manifest found. Applying..."
-			kubectl apply -f registration.yaml && APPLIED=true
-			rm registration.yaml
-		else
-			echo "❌ Downloaded manifest is invalid."
-			rm registration.yaml
-		fi
-	fi
-
-	if [ "$APPLIED" = true ]; then
-		# Patch for self-signed certificates
-		echo "🛡️ Waiting for cattle-cluster-agent deployment to appear..."
-		for i in {1..20}; do
-			if kubectl -n cattle-system get deployment cattle-cluster-agent &>/dev/null; then
-				echo "✅ Agent deployment found. Patching for insecure connection..."
-				# We set CATTLE_INSECURE=true, CATTLE_INSECURE_SKIP_VERIFY=true AND clear CATTLE_CA_CHECKSUM to bypass all TLS checks
-				kubectl -n cattle-system patch deployment cattle-cluster-agent --type=json \
-					-p '[{"op":"add", "path":"/spec/template/spec/containers/0/env/-", "value":{"name":"CATTLE_INSECURE", "value":"true"}}, {"op":"add", "path":"/spec/template/spec/containers/0/env/-", "value":{"name":"CATTLE_INSECURE_SKIP_VERIFY", "value":"true"}}, {"op":"add", "path":"/spec/template/spec/containers/0/env/-", "value":{"name":"CATTLE_CA_CHECKSUM", "value":""}}]'
-				break
-			fi
-			sleep 10
-		done
+	
+	if [ ! -z "$CLUSTER_TOKEN" ] && [ "$CLUSTER_TOKEN" != "null" ]; then
+		# Official Rancher UI pattern for insecure import:
+		# curl --insecure -sfL https://<host>/v3/import/<token>.yaml | kubectl apply -f -
+		local REG_CMD="curl --insecure -sfL https://$rancher_host/v3/import/${CLUSTER_TOKEN}.yaml | kubectl apply -f -"
+		echo "Executing: $REG_CMD"
+		eval "$REG_CMD" || echo "⚠️ Warning: Failed to apply Rancher registration."
 	else
-		echo "❌ Could not find or construct registration command."
+		echo "❌ Could not find valid cluster token for registration."
 	fi
 
 	kubectl config use-context "$CLUSTER_MAIN_NAME"
@@ -453,7 +414,7 @@ import_to_rancher() {
 
 # Run Rancher steps, but don't fail the whole script if they hit a snag
 install_rancher "$CLUSTER_MAIN_NAME" || echo "⚠️ Rancher install issue."
-import_to_rancher "$CLUSTER_EDGE_NAME" || echo "⚠️ Edge import issue."
+# import_to_rancher "$CLUSTER_EDGE_NAME" || echo "⚠️ Edge import issue."
 
 # Get the final Rancher URL (using LoadBalancer IP)
 FINAL_RANCHER_IP=$(kubectl -n cattle-system get svc rancher -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "$MAIN_IP")
