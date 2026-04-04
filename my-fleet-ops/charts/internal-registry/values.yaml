@@ -1,0 +1,9 @@
+replicaCount: 1
+image:
+  repository: registry
+  tag: "2.8"
+service:
+  type: LoadBalancer
+  port: 5000
+persistence:
+  enabled: false # Set to true and provide a PVC for production

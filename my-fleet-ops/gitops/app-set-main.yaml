@@ -19,6 +19,8 @@ spec:
                   appName: golang-api
                 - appPath: my-fleet-ops/charts/mqtt-broker
                   appName: mqtt-broker
+                - appPath: my-fleet-ops/charts/internal-registry
+                  appName: internal-registry
   template:
     metadata:
       name: '{{values.clusterName}}-{{appName}}'
