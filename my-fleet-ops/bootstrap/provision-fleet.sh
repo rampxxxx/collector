@@ -162,7 +162,7 @@ else
 	fi
 fi
 
-# 2.5 CONFIGURE METALLB
+# 2.5 CONFIGURE METALLB & REGISTRY
 install_metallb() {
 	local context=$1
 	local ip_prefix=$2
@@ -177,11 +177,8 @@ install_metallb() {
 		echo "⏳ Waiting for MetalLB pods to be registered..."
 		sleep 10
 		kubectl wait --for=condition=ready pod -l app=metallb -n metallb-system --timeout=300s
-	else
-		echo "✅ MetalLB already installed on $context. Ensuring config is up to date..."
 	fi
 
-	# ALWAYS configure/update MetalLB
 	cat <<EOF | kubectl apply -f -
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
@@ -200,10 +197,23 @@ metadata:
 EOF
 }
 
+configure_registry_mirror() {
+    local ip=$1
+    local reg_ip=$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    echo "📦 Pushing registry config to $ip..."
+    ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$ip" "mkdir -p /etc/rancher/k3s && echo -e 'mirrors:\n  \"$reg_ip:5000\":\n    endpoint:\n      - \"http://$reg_ip:5000\"\nconfigs:\n  \"$reg_ip:5000\":\n    auth:\n      insecure: true' > /etc/rancher/k3s/registries.yaml && systemctl restart k3s || systemctl restart k3s-agent"
+}
+
 # Install MetalLB on Main (Range .200-.210)
 install_metallb "$CLUSTER_MAIN_NAME" "192.168.122" 200 210
 # Install MetalLB on Edge (Range .211-.220)
 install_metallb "$CLUSTER_EDGE_NAME" "192.168.122" 211 220
+
+# Wait for registry IP and push config
+echo "⏳ Waiting for internal registry IP..."
+while [ -z "$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 5; done
+configure_registry_mirror "$MAIN_IP"
+configure_registry_mirror "$EDGE_IP"
 
 # 3. Register Clusters with ArgoCD
 echo "🔗 Registering clusters with ArgoCD..."

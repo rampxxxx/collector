@@ -16,9 +16,7 @@ spec:
     spec:
       containers:
         - name: rust-collector
-          image: hashicorp/http-echo
-          args:
-            - "-text=Hello from Rust Collector on Edge Cluster"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           ports:
             - name: http
               containerPort: 5678
