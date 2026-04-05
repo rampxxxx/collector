@@ -17,6 +17,9 @@ spec:
       containers:
         - name: rust-collector
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          env:
+            - name: MQTT_BROKER
+              value: {{ .Values.env.MQTT_BROKER | quote }}
           ports:
             - name: http
               containerPort: 5678

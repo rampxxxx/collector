@@ -5,3 +5,5 @@ image:
 service:
   type: ClusterIP
   port: 80
+env:
+  MQTT_BROKER: "tcp://192.168.122.200:1883"
