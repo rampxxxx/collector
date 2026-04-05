@@ -198,10 +198,10 @@ EOF
 }
 
 configure_registry_mirror() {
-    local ip=$1
-    local reg_ip=$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-    echo "📦 Pushing registry config to $ip..."
-    ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$ip" "mkdir -p /etc/rancher/k3s && echo -e 'mirrors:\n  \"$reg_ip:5000\":\n    endpoint:\n      - \"http://$reg_ip:5000\"\nconfigs:\n  \"$reg_ip:5000\":\n    auth:\n      insecure: true' > /etc/rancher/k3s/registries.yaml && systemctl restart k3s || systemctl restart k3s-agent"
+	local ip=$1
+	local reg_ip=$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+	echo "📦 Pushing registry config to $ip..."
+	ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$ip" "mkdir -p /etc/rancher/k3s && echo -e 'mirrors:\n  \"$reg_ip:5000\":\n    endpoint:\n      - \"http://$reg_ip:5000\"\nconfigs:\n  \"$reg_ip:5000\":\n    auth:\n      insecure: true' > /etc/rancher/k3s/registries.yaml && systemctl restart k3s || systemctl restart k3s-agent"
 }
 
 # Install MetalLB on Main (Range .200-.210)
@@ -209,9 +209,7 @@ install_metallb "$CLUSTER_MAIN_NAME" "192.168.122" 200 210
 # Install MetalLB on Edge (Range .211-.220)
 install_metallb "$CLUSTER_EDGE_NAME" "192.168.122" 211 220
 
-# Wait for registry IP and push config
-echo "⏳ Waiting for internal registry IP..."
-while [ -z "$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 5; done
+# Push registry config
 configure_registry_mirror "$MAIN_IP"
 configure_registry_mirror "$EDGE_IP"
 
@@ -243,8 +241,45 @@ ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[
 # 4. Deploy Root Application
 echo "🚀 Deploying ArgoCD Root Application..."
 kubectl apply -f ../gitops/root-app.yaml
+#
+# Wait for registry and broker IPs
+echo "⏳ Waiting for internal registry and broker IPs..."
+while [ -z "$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ] ||
+	[ -z "$(kubectl get svc -n default main-cluster-mqtt-broker -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 5; done
 
-# 5. RANCHER INSTALLATION & IMPORT (Final Step)
+# Update edge-values.yaml with dynamic broker IP
+BROKER_IP=$(kubectl get svc -n default main-cluster-mqtt-broker -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+sed -i "s|MQTT_BROKER:.*|MQTT_BROKER: \"tcp://$BROKER_IP:1883\"|" ../apps-config/edge-values.yaml
+
+configure_host_registry() {
+    local reg_ip=$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    echo "⚙️ Configuring host Docker daemon for insecure registry ($reg_ip:5000)..."
+    sudo mkdir -p /etc/docker
+    if [ -f /etc/docker/daemon.json ]; then
+        sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+        echo "$(cat /etc/docker/daemon.json | jq -M --arg ip "$reg_ip:5000" '.["insecure-registries"] += [$ip] | .["insecure-registries"] |= unique')" | sudo tee /etc/docker/daemon.json > /dev/null
+    else
+        echo "{\"insecure-registries\": [\"$reg_ip:5000\"]}" | sudo tee /etc/docker/daemon.json > /dev/null
+    fi
+    sudo systemctl restart docker
+    echo "✅ Docker daemon configured for $reg_ip:5000"
+}
+
+# Update host docker daemon
+configure_host_registry
+
+# 5. CONFIGURE REGISTRY MIRROR
+# Now that internal-registry is deployed via ArgoCD, we push the config
+echo "⏳ Waiting for internal registry IP..."
+while [ -z "$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 5; done
+configure_registry_mirror "$MAIN_IP"
+configure_registry_mirror "$EDGE_IP"
+#
+# 5.1 Re-Deploy Root Application to have collector rust to have updated mqtt IP
+echo "🚀 Deploying ArgoCD Root Application..."
+kubectl apply -f ../gitops/root-app.yaml
+
+# 6. RANCHER INSTALLATION & IMPORT
 echo "🤠 Starting Rancher Setup..."
 
 install_rancher() {
@@ -345,7 +380,7 @@ import_to_rancher() {
 		-H "Authorization: Bearer $TOKEN" \
 		-H 'Content-Type: application/json' \
 		-X PUT \
-		-d "{\"value\":\"https://$rancher_host\"}" > /dev/null
+		-d "{\"value\":\"https://$rancher_host\"}" >/dev/null
 
 	# 2. Check/Create Cluster Resource
 	echo "🏗️ Checking cluster resource in Rancher..."
@@ -395,9 +430,9 @@ import_to_rancher() {
 		MANIFEST_URL=$(echo "$REG_DATA" | jq -r '.manifestUrl // ""')
 		CLUSTER_TOKEN=$(echo "$REG_DATA" | jq -r '.token // ""')
 
-		if ([ ! -z "$REG_VALUE" ] && [ "$REG_VALUE" != "null" ]) || \
-		   ([ ! -z "$MANIFEST_URL" ] && [ "$MANIFEST_URL" != "null" ]) || \
-		   ([ ! -z "$CLUSTER_TOKEN" ] && [ "$CLUSTER_TOKEN" != "null" ]); then
+		if ([ ! -z "$REG_VALUE" ] && [ "$REG_VALUE" != "null" ]) ||
+			([ ! -z "$MANIFEST_URL" ] && [ "$MANIFEST_URL" != "null" ]) ||
+			([ ! -z "$CLUSTER_TOKEN" ] && [ "$CLUSTER_TOKEN" != "null" ]); then
 			break
 		fi
 		echo "⏳ Waiting for Rancher to populate registration data ($i/20)..."
@@ -408,7 +443,7 @@ import_to_rancher() {
 	# 4. Apply to Edge Cluster (Insecure Import)
 	echo "🚀 Applying registration to $edge_context..."
 	kubectl config use-context "$edge_context"
-	
+
 	if [ ! -z "$CLUSTER_TOKEN" ] && [ "$CLUSTER_TOKEN" != "null" ]; then
 		# Official Rancher UI pattern for insecure import:
 		# curl --insecure -sfL https://<host>/v3/import/<token>.yaml | kubectl apply -f -
