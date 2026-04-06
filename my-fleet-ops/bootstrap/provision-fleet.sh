@@ -9,13 +9,7 @@ MAIN_VM_NAME="collector_main"
 EDGE_VM_NAME="collector_edge"
 RANCHER_ADMIN_USER="admin"
 
-# --- VM Creation ---
-echo "🖥️ Creating Virtual Machines..."
-# Main cluster needs more resources for Rancher (6GB RAM)
-VM_RAM=6144 VM_VCPUS=4 sudo -E "$VM_MANAGER" create "$MAIN_VM_NAME" "$HOME/.ssh"
-# Edge cluster can stay minimal
-sudo "$VM_MANAGER" create "$EDGE_VM_NAME" "$HOME/.ssh"
-
+# --- Functions ---
 get_vm_ip() {
 	local name=$1
 	local ip=""
@@ -28,21 +22,6 @@ get_vm_ip() {
 	done
 	echo "$ip"
 }
-
-MAIN_IP=$(get_vm_ip "$MAIN_VM_NAME")
-echo "📍 Main VM IP: $MAIN_IP"
-EDGE_IP=$(get_vm_ip "$EDGE_VM_NAME")
-echo "📍 Edge VM IP: $EDGE_IP"
-
-# --- Cleanup Stale Kubeconfig ---
-echo "🧹 Cleaning up stale kubeconfig entries..."
-kubectl config delete-context "main-cluster" 2>/dev/null || true
-kubectl config delete-cluster "main-cluster" 2>/dev/null || true
-kubectl config delete-user "main-cluster" 2>/dev/null || true
-kubectl config delete-context "edge-cluster" 2>/dev/null || true
-kubectl config delete-cluster "edge-cluster" 2>/dev/null || true
-kubectl config delete-user "edge-cluster" 2>/dev/null || true
-
 wait_for_cloud_init() {
 	local ip=$1
 	echo "⏳ Waiting for cloud-init to finish on $ip..." >&2
@@ -50,65 +29,6 @@ wait_for_cloud_init() {
 		sleep 5
 	done
 }
-
-wait_for_cloud_init "$MAIN_IP"
-wait_for_cloud_init "$EDGE_IP"
-
-# --- Cluster Types (The Core Identifiers) ---
-MAIN_TYPE="main"
-EDGE_TYPE="edge"
-
-# --- Cluster Names (Derived from Types) ---
-CLUSTER_MAIN_NAME="${MAIN_TYPE}-cluster"
-CLUSTER_EDGE_NAME="${EDGE_TYPE}-cluster"
-
-echo "🚀 Starting Fleet Provisioning..."
-echo "Configured: $CLUSTER_MAIN_NAME ($MAIN_TYPE) and $CLUSTER_EDGE_NAME ($EDGE_TYPE)"
-
-# 1. Provision Clusters via k3sup
-echo "📦 Installing K3s on $CLUSTER_MAIN_NAME..."
-k3sup install \
-	--ip "$MAIN_IP" \
-	--user "$SSH_USER" \
-	--ssh-key "$SSH_KEY" \
-	--context $CLUSTER_MAIN_NAME \
-	--local-path "$HOME/.kube/config" \
-	--merge \
-	--k3s-extra-args "--disable servicelb"
-
-echo "📦 Installing K3s on $CLUSTER_EDGE_NAME..."
-k3sup install \
-	--ip "$EDGE_IP" \
-	--user "$SSH_USER" \
-	--ssh-key "$SSH_KEY" \
-	--context $CLUSTER_EDGE_NAME \
-	--local-path "$HOME/.kube/config" \
-	--merge \
-	--k3s-extra-args "--disable traefik --disable servicelb"
-
-# 1.4 Fix Libvirt Firewall (if needed)
-if sudo nft list tables | grep -q "libvirt_network"; then
-	echo "🛡️ Fixing libvirt nftables for API access (Port 6443)..."
-	sudo nft insert rule ip libvirt_network forward oif "virbr0" tcp dport 6443 accept || true
-	echo "🛡️ Fixing libvirt nftables for NodePort access (30000-32767)..."
-	sudo nft insert rule ip libvirt_network forward oif "virbr0" tcp dport 30000-32767 accept || true
-fi
-
-# 1.5 Verify API Reachability
-echo "🔍 Checking API reachability for $CLUSTER_MAIN_NAME..."
-until curl -sk "https://$MAIN_IP:6443/livez" >/dev/null; do
-	echo "⏳ Waiting for API server at $MAIN_IP:6443..."
-	echo "🔍 Checking K3s status on VM..."
-	ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$MAIN_IP" "systemctl is-active k3s" || echo "⚠️ K3s service is NOT active yet."
-	echo "💡 Hint: Check your host firewall. You might need: sudo firewall-cmd --zone=libvirt --add-port=6443/tcp"
-	sleep 5
-done
-echo "✅ API server is reachable."
-
-# 2. INSTALL ARGOCD
-export KUBECONFIG=$HOME/.kube/config
-kubectl config use-context $CLUSTER_MAIN_NAME
-
 argocd_login_with_retries() {
 	local ip=$1
 	local port=$2
@@ -124,45 +44,6 @@ argocd_login_with_retries() {
 	done
 	return 1
 }
-
-if ! kubectl get ns argocd &>/dev/null; then
-	echo "📦 ArgoCD not found. Installing via Helm..."
-	helm repo add argo https://argoproj.github.io/argo-helm
-	helm repo update
-	helm install argocd argo/argo-cd \
-		--namespace argocd \
-		--create-namespace \
-		--set server.service.type=NodePort
-
-	echo "⏳ Waiting for ArgoCD pods..."
-	kubectl wait --for=condition=available deployment/argocd-server -n argocd --timeout=300s
-
-	# Retrieve Password
-	PASS=""
-	while [ -z "$PASS" ]; do
-		PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
-		[ -z "$PASS" ] && sleep 2
-	done
-
-	echo "$PASS" >argocd_initial_password.txt
-	chmod 600 argocd_initial_password.txt
-
-	# Get NodePort for login
-	ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
-	argocd_login_with_retries "$MAIN_IP" "$ARGOCD_PORT" "$PASS"
-else
-	echo "✅ ArgoCD already installed. Re-logging..."
-	PASS=$(cat argocd_initial_password.txt 2>/dev/null || echo "")
-	if [ ! -z "$PASS" ]; then
-		ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
-		argocd_login_with_retries "$MAIN_IP" "$ARGOCD_PORT" "$PASS"
-	else
-		echo "⚠️ No password file found, assuming already logged in or using --core"
-		argocd login --core
-	fi
-fi
-
-# 2.5 CONFIGURE METALLB & REGISTRY
 install_metallb() {
 	local context=$1
 	local ip_prefix=$2
@@ -203,20 +84,6 @@ configure_registry_mirror() {
 	echo "📦 Pushing registry config to $ip..."
 	ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$ip" "mkdir -p /etc/rancher/k3s && echo -e 'mirrors:\n  \"$reg_ip:5000\":\n    endpoint:\n      - \"http://$reg_ip:5000\"\nconfigs:\n  \"$reg_ip:5000\":\n    auth:\n      insecure: true' > /etc/rancher/k3s/registries.yaml && systemctl restart k3s || systemctl restart k3s-agent"
 }
-
-# Install MetalLB on Main (Range .200-.210)
-install_metallb "$CLUSTER_MAIN_NAME" "192.168.122" 200 210
-# Install MetalLB on Edge (Range .211-.220)
-install_metallb "$CLUSTER_EDGE_NAME" "192.168.122" 211 220
-
-# Push registry config
-configure_registry_mirror "$MAIN_IP"
-configure_registry_mirror "$EDGE_IP"
-
-# 3. Register Clusters with ArgoCD
-echo "🔗 Registering clusters with ArgoCD..."
-kubectl config use-context "$CLUSTER_MAIN_NAME"
-
 register_cluster_with_retries() {
 	local name=$1
 	local type=$2
@@ -232,56 +99,19 @@ register_cluster_with_retries() {
 	echo "❌ Failed to register $name after 10 attempts."
 	return 1
 }
-
-register_cluster_with_retries "$CLUSTER_MAIN_NAME" "$MAIN_TYPE"
-register_cluster_with_retries "$CLUSTER_EDGE_NAME" "$EDGE_TYPE"
-
-ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
-
-# 4. Deploy Root Application
-echo "🚀 Deploying ArgoCD Root Application..."
-kubectl apply -f ../gitops/root-app.yaml
-#
-# Wait for registry and broker IPs
-echo "⏳ Waiting for internal registry and broker IPs..."
-while [ -z "$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ] ||
-	[ -z "$(kubectl get svc -n default main-cluster-mqtt-broker -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 5; done
-
-# Update edge-values.yaml with dynamic broker IP
-BROKER_IP=$(kubectl get svc -n default main-cluster-mqtt-broker -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-sed -i "s|MQTT_BROKER:.*|MQTT_BROKER: \"tcp://$BROKER_IP:1883\"|" ../apps-config/edge-values.yaml
-
 configure_host_registry() {
-    local reg_ip=$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-    echo "⚙️ Configuring host Docker daemon for insecure registry ($reg_ip:5000)..."
-    sudo mkdir -p /etc/docker
-    if [ -f /etc/docker/daemon.json ]; then
-        sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
-        echo "$(cat /etc/docker/daemon.json | jq -M --arg ip "$reg_ip:5000" '.["insecure-registries"] += [$ip] | .["insecure-registries"] |= unique')" | sudo tee /etc/docker/daemon.json > /dev/null
-    else
-        echo "{\"insecure-registries\": [\"$reg_ip:5000\"]}" | sudo tee /etc/docker/daemon.json > /dev/null
-    fi
-    sudo systemctl restart docker
-    echo "✅ Docker daemon configured for $reg_ip:5000"
+	local reg_ip=$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+	echo "⚙️ Configuring host Docker daemon for insecure registry ($reg_ip:5000)..."
+	sudo mkdir -p /etc/docker
+	if [ -f /etc/docker/daemon.json ]; then
+		sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+		echo "$(cat /etc/docker/daemon.json | jq -M --arg ip "$reg_ip:5000" '.["insecure-registries"] += [$ip] | .["insecure-registries"] |= unique')" | sudo tee /etc/docker/daemon.json >/dev/null
+	else
+		echo "{\"insecure-registries\": [\"$reg_ip:5000\"]}" | sudo tee /etc/docker/daemon.json >/dev/null
+	fi
+	sudo systemctl restart docker
+	echo "✅ Docker daemon configured for $reg_ip:5000"
 }
-
-# Update host docker daemon
-configure_host_registry
-
-# 5. CONFIGURE REGISTRY MIRROR
-# Now that internal-registry is deployed via ArgoCD, we push the config
-echo "⏳ Waiting for internal registry IP..."
-while [ -z "$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 5; done
-configure_registry_mirror "$MAIN_IP"
-configure_registry_mirror "$EDGE_IP"
-#
-# 5.1 Re-Deploy Root Application to have collector rust to have updated mqtt IP
-echo "🚀 Deploying ArgoCD Root Application..."
-kubectl apply -f ../gitops/root-app.yaml
-
-# 6. RANCHER INSTALLATION & IMPORT
-echo "🤠 Starting Rancher Setup..."
-
 install_rancher() {
 	local context=$1
 	echo "📦 Installing Rancher UI on $context..."
@@ -456,6 +286,179 @@ import_to_rancher() {
 
 	kubectl config use-context "$CLUSTER_MAIN_NAME"
 }
+
+# --- VM Creation ---
+echo "🖥️ Creating Virtual Machines..."
+# Main cluster needs more resources for Rancher (6GB RAM)
+VM_RAM=6144 VM_VCPUS=4 sudo -E "$VM_MANAGER" create "$MAIN_VM_NAME" "$HOME/.ssh"
+# Edge cluster can stay minimal
+sudo "$VM_MANAGER" create "$EDGE_VM_NAME" "$HOME/.ssh"
+
+MAIN_IP=$(get_vm_ip "$MAIN_VM_NAME")
+echo "📍 Main VM IP: $MAIN_IP"
+EDGE_IP=$(get_vm_ip "$EDGE_VM_NAME")
+echo "📍 Edge VM IP: $EDGE_IP"
+
+# --- Cleanup Stale Kubeconfig ---
+echo "🧹 Cleaning up stale kubeconfig entries..."
+kubectl config delete-context "main-cluster" 2>/dev/null || true
+kubectl config delete-cluster "main-cluster" 2>/dev/null || true
+kubectl config delete-user "main-cluster" 2>/dev/null || true
+kubectl config delete-context "edge-cluster" 2>/dev/null || true
+kubectl config delete-cluster "edge-cluster" 2>/dev/null || true
+kubectl config delete-user "edge-cluster" 2>/dev/null || true
+
+wait_for_cloud_init "$MAIN_IP"
+wait_for_cloud_init "$EDGE_IP"
+
+# --- Cluster Types (The Core Identifiers) ---
+MAIN_TYPE="main"
+EDGE_TYPE="edge"
+
+# --- Cluster Names (Derived from Types) ---
+CLUSTER_MAIN_NAME="${MAIN_TYPE}-cluster"
+CLUSTER_EDGE_NAME="${EDGE_TYPE}-cluster"
+
+echo "🚀 Starting Fleet Provisioning..."
+echo "Configured: $CLUSTER_MAIN_NAME ($MAIN_TYPE) and $CLUSTER_EDGE_NAME ($EDGE_TYPE)"
+
+# 1. Provision Clusters via k3sup
+echo "📦 Installing K3s on $CLUSTER_MAIN_NAME..."
+k3sup install \
+	--ip "$MAIN_IP" \
+	--user "$SSH_USER" \
+	--ssh-key "$SSH_KEY" \
+	--context $CLUSTER_MAIN_NAME \
+	--local-path "$HOME/.kube/config" \
+	--merge \
+	--k3s-extra-args "--disable servicelb"
+
+echo "📦 Installing K3s on $CLUSTER_EDGE_NAME..."
+k3sup install \
+	--ip "$EDGE_IP" \
+	--user "$SSH_USER" \
+	--ssh-key "$SSH_KEY" \
+	--context $CLUSTER_EDGE_NAME \
+	--local-path "$HOME/.kube/config" \
+	--merge \
+	--k3s-extra-args "--disable traefik --disable servicelb"
+
+# 1.4 Fix Libvirt Firewall (if needed)
+if sudo nft list tables | grep -q "libvirt_network"; then
+	echo "🛡️ Fixing libvirt nftables for API access (Port 6443)..."
+	sudo nft insert rule ip libvirt_network forward oif "virbr0" tcp dport 6443 accept || true
+	echo "🛡️ Fixing libvirt nftables for NodePort access (30000-32767)..."
+	sudo nft insert rule ip libvirt_network forward oif "virbr0" tcp dport 30000-32767 accept || true
+fi
+
+# 1.5 Verify API Reachability
+echo "🔍 Checking API reachability for $CLUSTER_MAIN_NAME..."
+until curl -sk "https://$MAIN_IP:6443/livez" >/dev/null; do
+	echo "⏳ Waiting for API server at $MAIN_IP:6443..."
+	echo "🔍 Checking K3s status on VM..."
+	ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$MAIN_IP" "systemctl is-active k3s" || echo "⚠️ K3s service is NOT active yet."
+	echo "💡 Hint: Check your host firewall. You might need: sudo firewall-cmd --zone=libvirt --add-port=6443/tcp"
+	sleep 5
+done
+echo "✅ API server is reachable."
+
+# 2. INSTALL ARGOCD
+export KUBECONFIG=$HOME/.kube/config
+kubectl config use-context $CLUSTER_MAIN_NAME
+
+if ! kubectl get ns argocd &>/dev/null; then
+	echo "📦 ArgoCD not found. Installing via Helm..."
+	helm repo add argo https://argoproj.github.io/argo-helm
+	helm repo update
+	helm install argocd argo/argo-cd \
+		--namespace argocd \
+		--create-namespace \
+		--set server.service.type=NodePort
+
+	echo "⏳ Waiting for ArgoCD pods..."
+	kubectl wait --for=condition=available deployment/argocd-server -n argocd --timeout=300s
+
+	# Retrieve Password
+	PASS=""
+	while [ -z "$PASS" ]; do
+		PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
+		[ -z "$PASS" ] && sleep 2
+	done
+
+	echo "$PASS" >argocd_initial_password.txt
+	chmod 600 argocd_initial_password.txt
+
+	# Get NodePort for login
+	ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
+	argocd_login_with_retries "$MAIN_IP" "$ARGOCD_PORT" "$PASS"
+else
+	echo "✅ ArgoCD already installed. Re-logging..."
+	PASS=$(cat argocd_initial_password.txt 2>/dev/null || echo "")
+	if [ ! -z "$PASS" ]; then
+		ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
+		argocd_login_with_retries "$MAIN_IP" "$ARGOCD_PORT" "$PASS"
+	else
+		echo "⚠️ No password file found, assuming already logged in or using --core"
+		argocd login --core
+	fi
+fi
+
+# 2.5 CONFIGURE METALLB & REGISTRY
+
+# Install MetalLB on Main (Range .200-.210)
+install_metallb "$CLUSTER_MAIN_NAME" "192.168.122" 200 210
+# Install MetalLB on Edge (Range .211-.220)
+install_metallb "$CLUSTER_EDGE_NAME" "192.168.122" 211 220
+
+# Push registry config
+configure_registry_mirror "$MAIN_IP"
+configure_registry_mirror "$EDGE_IP"
+
+# 3. Register Clusters with ArgoCD
+echo "🔗 Registering clusters with ArgoCD..."
+kubectl config use-context "$CLUSTER_MAIN_NAME"
+
+register_cluster_with_retries "$CLUSTER_MAIN_NAME" "$MAIN_TYPE"
+register_cluster_with_retries "$CLUSTER_EDGE_NAME" "$EDGE_TYPE"
+
+ARGOCD_PORT=$(kubectl -n argocd get svc argocd-server -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
+
+# 4. Deploy Root Application
+echo "🚀 Deploying ArgoCD Root Application..."
+kubectl apply -f ../gitops/root-app.yaml
+#
+# Wait for registry and broker IPs
+echo "⏳ Waiting for internal registry and broker IPs..."
+while [ -z "$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ] ||
+	[ -z "$(kubectl get svc -n default main-cluster-mqtt-broker -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 5; done
+
+# Update edge-values.yaml with dynamic broker and registry IPs
+BROKER_IP=$(kubectl get svc -n default main-cluster-mqtt-broker -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+REG_IP=$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+sed -i "s|repository:.*|repository: $REG_IP:5000/rust-collector|" ../apps-config/edge-values.yaml
+sed -i "s|MQTT_BROKER:.*|MQTT_BROKER: \"tcp://$BROKER_IP:1883\"|" ../apps-config/edge-values.yaml
+
+# Update host docker daemon
+configure_host_registry
+
+# 4.1 Build and push Rust Collector
+echo "🏗️ Building and pushing Rust Collector..."
+cd ../../rust-collector && make push && cd - >/dev/null
+
+# 5. CONFIGURE REGISTRY MIRROR
+# Now that internal-registry is deployed via ArgoCD, we push the config
+echo "⏳ Waiting for internal registry IP..."
+while [ -z "$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 5; done
+configure_registry_mirror "$MAIN_IP"
+configure_registry_mirror "$EDGE_IP"
+#
+# 5.1 Re-Deploy Root Application to have collector rust to have updated mqtt IP
+echo "🚀 Deploying ArgoCD Root Application..."
+kubectl apply -f ../gitops/root-app.yaml
+
+# 6. RANCHER INSTALLATION & IMPORT
+echo "🤠 Starting Rancher Setup..."
 
 # Run Rancher steps, but don't fail the whole script if they hit a snag
 install_rancher "$CLUSTER_MAIN_NAME" || echo "⚠️ Rancher install issue."
