@@ -2,4 +2,4 @@ image:
   repository: 192.168.122.201:5000/golang-api
   tag: latest
 env:
-  MQTT_BROKER: "tcp://192.168.122.200:1883"
+  MQTT_BROKER: "tcp://192.168.122.202:1883"
