@@ -16,9 +16,10 @@ spec:
     spec:
       containers:
         - name: golang-api
-          image: hashicorp/http-echo
-          args:
-            - "-text=Hello from Golang API on Main Cluster"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          env:
+            - name: MQTT_BROKER
+              value: {{ .Values.env.MQTT_BROKER | quote }}
           ports:
             - name: http
               containerPort: 5678

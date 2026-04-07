@@ -438,6 +438,9 @@ REG_IP=$(kubectl get svc -n default main-cluster-internal-registry -o jsonpath='
 
 sed -i "s|repository:.*|repository: $REG_IP:5000/rust-collector|" ../apps-config/edge-values.yaml
 sed -i "s|MQTT_BROKER:.*|MQTT_BROKER: \"tcp://$BROKER_IP:1883\"|" ../apps-config/edge-values.yaml
+# Update main-values.yaml with dynamic broker and registry IPs
+sed -i "s|repository:.*|repository: $REG_IP:5000/golang-api|" ../apps-config/main-values.yaml
+sed -i "s|MQTT_BROKER:.*|MQTT_BROKER: \"tcp://$BROKER_IP:1883\"|" ../apps-config/main-values.yaml
 
 # Update host docker daemon
 configure_host_registry
