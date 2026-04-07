@@ -1,0 +1,12 @@
+replicaCount: 1
+service:
+  type: LoadBalancer
+  port: 1883
+persistence:
+  enabled: false
+config: |
+  persistence true
+  persistence_location /mosquitto/data/
+  log_dest stdout
+  listener 1883
+  allow_anonymous true

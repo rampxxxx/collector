@@ -32,7 +32,7 @@ spec:
         path: '{{appPath}}'
         helm:
           valueFiles:
-            - ../../apps-config/main-values.yaml
+            - ../../apps-config/{{appName}}-values.yaml
       destination:
         server: '{{server}}'
         namespace: default
