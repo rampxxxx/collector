@@ -233,6 +233,24 @@ sudo virsh net-start host-bridge
 sudo ./vm_manager.sh create my-vm ~/.ssh br0
 ```
 
+
+## Next Steps
+
+This project is now a functional GitOps-managed IoT data pipeline. The following roadmap outlines the evolution towards a production-ready system:
+
+### Phase 1: Data Persistence
+- [ ] Add PostgreSQL Helm chart to `main-cluster` via ArgoCD.
+- [ ] Update `golang-api` to persist incoming MQTT data into the database.
+
+### Phase 2: Sensor Abstraction
+- [ ] Refactor `rust-collector` to support a trait-based architecture.
+- [ ] Add support for `SENSOR_TYPE=mock` and `SENSOR_TYPE=real` environment variables.
+
+### Phase 3: Production Hardening
+- [ ] Implement **ExternalDNS** to automatically sync LoadBalancer IPs with the public DDNS provider.
+- [ ] Deploy **cert-manager** and configure **Let's Encrypt** for trusted SSL certificates.
+- [ ] Replace self-signed configurations with real, CA-signed certificates for Rancher and service endpoints.
+
 ## cloud init
 
 
